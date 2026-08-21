@@ -23,7 +23,7 @@ from meta_uploader import (
     create_ad,
     create_video_creative,
     poll_video_ready,
-    upload_video_resumable,
+    upload_video,
 )
 
 st.set_page_config(page_title="MP4 → Meta Video Push", page_icon="🎬", layout="wide")
@@ -181,9 +181,9 @@ try:
         render(tbl_ph, live)
 
         try:
-            # Step 1 — Upload to Meta (resumable chunked)
+            # Step 1 — Upload to Meta (direct multipart)
             with st.spinner(f"⬆️ Uploading {fname}…"):
-                video_id, err = upload_video_resumable(meta_token, ad_account_id, file_path, name)
+                video_id, err = upload_video(meta_token, ad_account_id, file_path, name)
 
             if not video_id:
                 row.update({"status": "failed", "error": f"Upload: {err}"})

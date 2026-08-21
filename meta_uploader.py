@@ -53,54 +53,27 @@ def _err(d: dict) -> str | None:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def upload_video_resumable(
+def upload_video(
     token: str, ad_account_id: str, file_path: str, name: str
 ) -> tuple[str | None, str | None]:
     """
-    Chunked resumable upload to act_{ad_account_id}/advideos.
+    Direct multipart upload to act_{ad_account_id}/advideos.
     Returns (video_id, error_message).
+    Works for files up to ~1 GB. Simpler than chunked upload and
+    returns the video id immediately without a session dance.
     """
-    file_size = os.path.getsize(file_path)
     endpoint = f"act_{ad_account_id}/advideos"
-
-    # 1. Start
-    d = _post(endpoint, token, data={"upload_phase": "start", "file_size": file_size, "name": name})
-    if err := _err(d):
-        return None, f"[start] {err}"
-
-    session_id   = d["upload_session_id"]
-    start_offset = int(d["start_offset"])
-    end_offset   = int(d["end_offset"])
-
-    # 2. Transfer (chunked)
     with open(file_path, "rb") as f:
-        while start_offset < file_size:
-            chunk_size = end_offset - start_offset
-            f.seek(start_offset)
-            chunk = f.read(chunk_size)
-            d = _post(
-                endpoint, token,
-                data={
-                    "upload_phase":      "transfer",
-                    "upload_session_id": session_id,
-                    "start_offset":      start_offset,
-                    "end_offset":        end_offset,
-                },
-                files={"video_file_chunk": ("chunk.mp4", chunk, "application/octet-stream")},
-            )
-            if err := _err(d):
-                return None, f"[transfer @{start_offset}] {err}"
-            start_offset = int(d["start_offset"])
-            end_offset   = int(d["end_offset"])
-
-    # 3. Finish
-    d = _post(endpoint, token, data={"upload_phase": "finish", "upload_session_id": session_id})
+        d = _post(
+            endpoint, token,
+            data={"name": name},
+            files={"source": (os.path.basename(file_path), f, "video/mp4")},
+        )
     if err := _err(d):
-        return None, f"[finish] {err}"
-
-    video_id = d.get("video_id")
+        return None, err
+    video_id = d.get("id")
     if not video_id:
-        return None, f"[finish] no video_id in response: {d}"
+        return None, f"no video id in response: {d}"
     return video_id, None
 
 
