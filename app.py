@@ -1,14 +1,18 @@
 """
-app.py — MP4 → Meta Video Push Tool
--------------------------------------
-Flow:
-  1. Upload a zip OR point to a local folder  →  list MP4s
-  2. Select videos  →  configure creative details
-  3. Push           →  live row-by-row status table
-  4. Download results CSV
+app.py — MP4 → Meta Video Push Tool  (parallel edition)
+---------------------------------------------------------
+Phased parallel pipeline:
+  Phase 1 — Upload all videos simultaneously
+  Phase 2 — Poll all videos for ready status simultaneously
+  Phase 3 — Create creatives simultaneously
+  Phase 4 — Create ads simultaneously
+
+Each phase waits for all videos before moving to the next,
+so the live status table stays accurate and readable.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import streamlit as st
@@ -29,29 +33,33 @@ from meta_uploader import (
 st.set_page_config(page_title="MP4 → Meta Video Push", page_icon="🎬", layout="wide")
 
 STATUS_EMOJI = {
-    "pending": "⏳",
-    "running": "🔄",
-    "success": "✅",
-    "failed":  "❌",
+    "pending":  "⏳",
+    "uploading":"⬆️",
+    "encoding": "🔄",
+    "creating": "🎨",
+    "success":  "✅",
+    "failed":   "❌",
 }
+
+MAX_WORKERS = 5   # parallel threads per phase
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ Config")
 
     st.subheader("Meta")
-    meta_token    = st.text_area("Access Token", height=80, placeholder="Paste Meta access token…")
-    meta_token    = meta_token.strip()
-    ad_account_id = st.text_input("Ad Account ID",    value="1549883851784009", help="Without act_ prefix")
-    page_id       = st.text_input("Facebook Page ID", value="336701269535125")
-    campaign_id   = st.text_input("Campaign ID",      value="120254711147130664", help="Reference only — ad is placed under Ad Set ID")
-    adset_id      = st.text_input("Ad Set ID",        value="120254711147130664")
-    product_set_id = st.text_input("Product Set ID",  value="1069261742506823", help="Catalogue product set linked to all creatives")
+    meta_token     = st.text_area("Access Token", height=80, placeholder="Paste Meta access token…")
+    meta_token     = meta_token.strip()
+    ad_account_id  = st.text_input("Ad Account ID",    value="621093273817881", help="Without act_ prefix")
+    page_id        = st.text_input("Facebook Page ID", value="102334935420271")
+    campaign_id    = st.text_input("Campaign ID",      value="120254711147130664", help="Reference only")
+    adset_id       = st.text_input("Ad Set ID",        value="120254711383200664")
+    product_set_id = st.text_input("Product Set ID",   value="1069261742506823")
 
     st.divider()
     st.subheader("Ad Creative")
     cta_type   = st.selectbox("CTA Type", ["SHOP_NOW", "LEARN_MORE", "SIGN_UP", "DOWNLOAD", "INSTALL_MOBILE_APP"])
-    cta_link   = st.text_input("CTA Link", placeholder="https://...")
+    cta_link   = st.text_input("CTA Link", value="http://fkrt.it/cPDqXgNN")
     ad_message = st.text_input("Ad Message", placeholder="Check out our latest!")
     ad_title   = st.text_input("Ad Title",   placeholder="Optional — falls back to filename")
 
@@ -62,15 +70,14 @@ with st.sidebar:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 st.title("🎬 MP4 → Meta Video Push")
-st.caption("Reads MP4s from a zip or local folder → uploads to Meta → creates video ads under your ad set.")
+st.caption("Parallel pipeline: uploads all videos simultaneously, then polls and creates ads in bulk.")
 
 if not meta_token:
     st.info("🔑 Paste your Meta access token in the sidebar.")
     st.stop()
 
-# ── Source: zip upload or folder ──────────────────────────────────────────────
-tmp_dir  = None
-files    = []
+# ── Source ────────────────────────────────────────────────────────────────────
+tmp_dir = None
 
 if source_mode == "Upload zip file":
     uploaded_zip = st.file_uploader("Upload your video zip file", type=["zip"])
@@ -89,9 +96,8 @@ else:
         st.error(f"Folder not found: `{folder_path}`")
         st.stop()
 
-# ── List MP4s ─────────────────────────────────────────────────────────────────
+# ── List files ────────────────────────────────────────────────────────────────
 st.subheader("📁 MP4 Files")
-
 try:
     files = list_mp4_files(folder_path)
 except Exception as e:
@@ -102,23 +108,20 @@ if not files:
     st.warning("No .mp4 files found.")
     st.stop()
 
-file_df = pd.DataFrame([{
-    "Name":      f["name"],
-    "Size (MB)": f"{f['size'] / 1024 / 1024:.1f}",
-} for f in files])
-
 st.success(f"Found **{len(files)}** MP4 file(s)")
 with st.expander("Preview files", expanded=True):
-    st.dataframe(file_df, use_container_width=True, hide_index=True)
+    st.dataframe(
+        pd.DataFrame([{"Name": f["name"], "Size (MB)": f"{f['size']/1024/1024:.1f}"} for f in files]),
+        use_container_width=True, hide_index=True,
+    )
 
 # ── Selection ─────────────────────────────────────────────────────────────────
 selected_indices = st.multiselect(
-    "Select videos to push to Meta:",
+    "Select videos to push:",
     options=list(range(len(files))),
-    format_func=lambda i: f"{files[i]['name']}  ({files[i]['size'] / 1024 / 1024:.1f} MB)",
+    format_func=lambda i: f"{files[i]['name']}  ({files[i]['size']/1024/1024:.1f} MB)",
     default=list(range(len(files))),
 )
-
 if not selected_indices:
     st.info("Select at least one video.")
     st.stop()
@@ -126,7 +129,7 @@ if not selected_indices:
 selected = [files[i] for i in selected_indices]
 
 if not cta_link:
-    st.warning("⚠️ Enter a CTA link in the sidebar before pushing.")
+    st.warning("⚠️ Enter a CTA link in the sidebar.")
     st.stop()
 
 st.divider()
@@ -138,18 +141,25 @@ st.markdown(
 if not st.button(f"🚀 Push {len(selected)} video(s) to Meta", type="primary"):
     st.stop()
 
-# ── Live status table ─────────────────────────────────────────────────────────
+# ── Shared state ──────────────────────────────────────────────────────────────
+total = len(selected)
 live = [
-    {"name": f["name"], "status": "pending",
-     "video_id": None, "creative_id": None, "ad_id": None, "error": ""}
+    {
+        "name": f["name"], "status": "pending",
+        "video_id": None, "creative_id": None, "ad_id": None, "error": "",
+        "file_path": get_local_path(f),
+        "ad_name": os.path.splitext(f["name"])[0],
+    }
     for f in selected
 ]
+
 tbl_ph   = st.empty()
-prog_bar = st.progress(0)
-total    = len(selected)
+phase_ph = st.empty()
 
 
-def render(ph, rows):
+def render(ph, rows, phase_label=""):
+    if phase_label:
+        phase_ph.info(phase_label)
     ph.dataframe(
         pd.DataFrame([{
             "File":     r["name"],
@@ -159,91 +169,129 @@ def render(ph, rows):
             "Ad ID":    r["ad_id"]       or "—",
             "Error":    r["error"]       or "",
         } for r in rows]),
-        use_container_width=True,
-        hide_index=True,
+        use_container_width=True, hide_index=True,
     )
 
 
 render(tbl_ph, live)
-results = []
 
-try:
-    for idx, (finfo, row) in enumerate(zip(selected, live)):
-        fname     = finfo["name"]
-        file_path = get_local_path(finfo)
-        name      = os.path.splitext(fname)[0]
-        title     = ad_title.strip() or name
-        message   = ad_message.strip() or name
-        ps_id     = product_set_id.strip() or None
+# ── Helper: run a phase in parallel ──────────────────────────────────────────
+def run_phase(fn_map: dict):
+    """
+    fn_map: {idx: callable}  — each callable returns its result.
+    Runs all in parallel, collects results by idx.
+    """
+    results = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(fn): idx for idx, fn in fn_map.items()}
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                results[idx] = ("error", str(e))
+    return results
 
-        prog_bar.progress(idx / total, text=f"Processing {fname} ({idx + 1}/{total})…")
-        row["status"] = "running"
-        render(tbl_ph, live)
 
-        try:
-            # Step 1 — Upload to Meta (direct multipart)
-            with st.spinner(f"⬆️ Uploading {fname}…"):
-                video_id, err = upload_video(meta_token, ad_account_id, file_path, name)
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 1 — Upload all videos in parallel
+# ═══════════════════════════════════════════════════════════════════════════════
+for r in live:
+    r["status"] = "uploading"
+render(tbl_ph, live, f"📤 Phase 1/4 — Uploading {total} videos in parallel…")
 
-            if not video_id:
-                row.update({"status": "failed", "error": f"Upload: {err}"})
-                render(tbl_ph, live)
-                results.append({**finfo, **row})
-                continue
+def _upload(idx):
+    r = live[idx]
+    video_id, err = upload_video(meta_token, ad_account_id, r["file_path"], r["ad_name"])
+    return video_id, err
 
-            row["video_id"] = video_id
-            render(tbl_ph, live)
+upload_results = run_phase({i: (lambda i=i: _upload(i)) for i in range(total)})
 
-            # Step 2 — Wait for encoding
-            with st.spinner(f"⏳ Encoding {fname}…"):
-                ready, msg = poll_video_ready(meta_token, video_id)
+for i, (video_id, err) in upload_results.items():
+    if video_id:
+        live[i]["video_id"] = video_id
+    else:
+        live[i].update({"status": "failed", "error": f"Upload: {err}"})
 
-            if not ready:
-                row.update({"status": "failed", "error": f"Not ready: {msg}"})
-                render(tbl_ph, live)
-                results.append({**finfo, **row})
-                continue
+render(tbl_ph, live)
 
-            # Step 3 — Create creative
-            creative_id, err = create_video_creative(
-                meta_token, ad_account_id, page_id,
-                video_id, name, message, title, cta_type, cta_link,
-                product_set_id=ps_id,
-            )
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — Poll all uploaded videos for ready status in parallel
+# ═══════════════════════════════════════════════════════════════════════════════
+to_poll = [i for i in range(total) if live[i].get("video_id") and live[i]["status"] != "failed"]
+for i in to_poll:
+    live[i]["status"] = "encoding"
+render(tbl_ph, live, f"⏳ Phase 2/4 — Waiting for {len(to_poll)} videos to finish encoding…")
 
-            if not creative_id:
-                row.update({"status": "failed", "error": f"Creative: {err}"})
-                render(tbl_ph, live)
-                results.append({**finfo, **row})
-                continue
+def _poll(idx):
+    return poll_video_ready(meta_token, live[idx]["video_id"])
 
-            row["creative_id"] = creative_id
+poll_results = run_phase({i: (lambda i=i: _poll(i)) for i in to_poll})
 
-            # Step 4 — Create ad
-            ad_id, err = create_ad(meta_token, ad_account_id, name, adset_id, creative_id)
+for i, (ready, msg) in poll_results.items():
+    if not ready:
+        live[i].update({"status": "failed", "error": f"Encoding: {msg}"})
 
-            if ad_id:
-                row.update({"status": "success", "ad_id": ad_id})
-            else:
-                row.update({"status": "failed", "error": f"Ad: {err}"})
+render(tbl_ph, live)
 
-        except Exception as exc:
-            row.update({"status": "failed", "error": str(exc)})
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 3 — Create creatives in parallel
+# ═══════════════════════════════════════════════════════════════════════════════
+to_create = [i for i in to_poll if live[i]["status"] != "failed"]
+for i in to_create:
+    live[i]["status"] = "creating"
+render(tbl_ph, live, f"🎨 Phase 3/4 — Creating {len(to_create)} ad creatives in parallel…")
 
-        render(tbl_ph, live)
-        results.append({**finfo, **row})
+def _creative(idx):
+    r = live[idx]
+    name    = r["ad_name"]
+    title   = ad_title.strip() or name
+    message = ad_message.strip() or name
+    ps_id   = product_set_id.strip() or None
+    return create_video_creative(
+        meta_token, ad_account_id, page_id,
+        r["video_id"], name, message, title, cta_type, cta_link,
+        product_set_id=ps_id,
+    )
 
-finally:
-    # Clean up temp extraction dir if we used zip upload
-    if tmp_dir:
-        cleanup_temp_dir(tmp_dir)
+creative_results = run_phase({i: (lambda i=i: _creative(i)) for i in to_create})
 
-prog_bar.progress(1.0, text="Done!")
+for i, (creative_id, err) in creative_results.items():
+    if creative_id:
+        live[i]["creative_id"] = creative_id
+    else:
+        live[i].update({"status": "failed", "error": f"Creative: {err}"})
+
+render(tbl_ph, live)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 4 — Create ads in parallel
+# ═══════════════════════════════════════════════════════════════════════════════
+to_ads = [i for i in to_create if live[i].get("creative_id")]
+render(tbl_ph, live, f"📢 Phase 4/4 — Creating {len(to_ads)} ads…")
+
+def _ad(idx):
+    r = live[idx]
+    return create_ad(meta_token, ad_account_id, r["ad_name"], adset_id, r["creative_id"])
+
+ad_results = run_phase({i: (lambda i=i: _ad(i)) for i in to_ads})
+
+for i, (ad_id, err) in ad_results.items():
+    if ad_id:
+        live[i].update({"status": "success", "ad_id": ad_id})
+    else:
+        live[i].update({"status": "failed", "error": f"Ad: {err}"})
+
+# Cleanup
+if tmp_dir:
+    cleanup_temp_dir(tmp_dir)
+
+phase_ph.success("✅ All done!")
+render(tbl_ph, live)
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 st.divider()
-result_df = pd.DataFrame(results)
-
+result_df = pd.DataFrame(live)
 c1, c2 = st.columns(2)
 c1.metric("✅ Success", int((result_df["status"] == "success").sum()))
 c2.metric("❌ Failed",  int((result_df["status"] == "failed").sum()))
