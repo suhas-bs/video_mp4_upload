@@ -95,6 +95,20 @@ def poll_video_ready(
     return False, f"timed out after {max_retries * interval}s (last status: {vs!r})"
 
 
+def get_video_thumbnail(token: str, video_id: str) -> str | None:
+    """
+    Fetch the auto-generated thumbnail URI from a processed video.
+    Returns the preferred thumbnail URL, or None if unavailable.
+    """
+    d = _get(video_id, token, fields="thumbnails")
+    thumbs = d.get("thumbnails", {}).get("data", [])
+    if not thumbs:
+        return None
+    # prefer the one Meta marks as preferred, else take first
+    preferred = next((t for t in thumbs if t.get("is_preferred")), thumbs[0])
+    return preferred.get("uri")
+
+
 def create_video_creative(
     token: str,
     ad_account_id: str,
@@ -111,17 +125,23 @@ def create_video_creative(
     Create a video ad creative. Returns (creative_id, error).
     Optionally attaches a product set (catalogue) to the creative.
     """
-    story_spec = {
-        "page_id": page_id,
-        "video_data": {
-            "video_id": video_id,
-            "message":  message,
-            "title":    title,
-            "call_to_action": {
-                "type":  cta_type,
-                "value": {"link": cta_link},
-            },
+    video_data: dict = {
+        "video_id": video_id,
+        "message":  message,
+        "title":    title,
+        "call_to_action": {
+            "type":  cta_type,
+            "value": {"link": cta_link},
         },
+    }
+    # Meta requires a thumbnail — fetch the auto-generated one
+    thumb_url = get_video_thumbnail(token, video_id)
+    if thumb_url:
+        video_data["image_url"] = thumb_url
+
+    story_spec = {
+        "page_id":    page_id,
+        "video_data": video_data,
     }
     data = {
         "name":              name,
