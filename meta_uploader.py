@@ -1,8 +1,6 @@
 """
 meta_uploader.py — Meta Graph API helpers
-Direct video upload → poll ready → create video creative → create ad.
-- All requests have explicit timeouts (no silent hangs)
-- Transient failures auto-retry up to 3 times with backoff
+Upload → poll encoding → create creative → create ad.
 """
 import json
 import os
@@ -17,16 +15,24 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 GRAPH       = "https://graph.facebook.com"
 API_VERSION = "v22.0"
 
-# Timeouts: (connect_seconds, read_seconds)
-T_DEFAULT = (10, 60)
-T_UPLOAD  = (15, 300)   # video upload can be slow on Meta's end
-T_POLL    = (10, 30)
+
+def _url(path: str) -> str:
+    return f"{GRAPH}/{API_VERSION}/{path}"
 
 
-# ── Retry decorator ───────────────────────────────────────────────────────────
+def _err(d: dict) -> str | None:
+    if "error" not in d:
+        return None
+    e = d["error"]
+    msg = e.get("message", str(d))
+    for k in ("error_user_msg", "error_user_title"):
+        if e.get(k):
+            msg += f" | {e[k]}"
+    return msg
+
 
 def _retry(max_attempts=3, wait=3):
-    """Retry on requests exceptions (network hiccup, timeout) with backoff."""
+    """Retry on network errors with backoff. Only for upload/create — NOT for polling."""
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -43,28 +49,9 @@ def _retry(max_attempts=3, wait=3):
     return decorator
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
-
-def _url(path: str) -> str:
-    return f"{GRAPH}/{API_VERSION}/{path}"
-
-
 @_retry()
-def _get(path: str, token: str, timeout=T_DEFAULT, **params) -> dict:
-    r = requests.get(
-        _url(path),
-        params={"access_token": token, **params},
-        timeout=timeout,
-        verify=False,
-    )
-    try:
-        return r.json()
-    except Exception:
-        return {"error": {"message": f"{r.status_code}: {r.text[:400]}"}}
-
-
-@_retry()
-def _post(path: str, token: str, data: dict = None, files=None, timeout=T_DEFAULT) -> dict:
+def _post(path: str, token: str, data: dict = None, files=None,
+          timeout=(15, 300)) -> dict:
     r = requests.post(
         _url(path),
         params={"access_token": token},
@@ -79,15 +66,34 @@ def _post(path: str, token: str, data: dict = None, files=None, timeout=T_DEFAUL
         return {"error": {"message": f"{r.status_code}: {r.text[:400]}"}}
 
 
-def _err(d: dict) -> str | None:
-    if "error" not in d:
-        return None
-    e = d["error"]
-    msg = e.get("message", str(d))
-    for k in ("error_user_msg", "error_user_title"):
-        if e.get(k):
-            msg += f" | {e[k]}"
-    return msg
+def _get_once(path: str, token: str, timeout=(10, 20), **params) -> dict:
+    """Single GET with no retry — used for polling so we never silently hang."""
+    try:
+        r = requests.get(
+            _url(path),
+            params={"access_token": token, **params},
+            timeout=timeout,
+            verify=False,
+        )
+        return r.json()
+    except Exception as e:
+        # Return a transient marker — caller treats this as "try again"
+        return {"_network_error": str(e)}
+
+
+@_retry()
+def _get(path: str, token: str, timeout=(10, 30), **params) -> dict:
+    """Retrying GET — used for creative/thumbnail fetches, not polling."""
+    r = requests.get(
+        _url(path),
+        params={"access_token": token, **params},
+        timeout=timeout,
+        verify=False,
+    )
+    try:
+        return r.json()
+    except Exception:
+        return {"error": {"message": f"{r.status_code}: {r.text[:400]}"}}
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -95,17 +101,13 @@ def _err(d: dict) -> str | None:
 def upload_video(
     token: str, ad_account_id: str, file_path: str, name: str
 ) -> tuple[str | None, str | None]:
-    """
-    Direct multipart upload. Returns (video_id, error).
-    Uses a generous 5-minute read timeout — Meta can be slow to acknowledge.
-    """
+    """Direct multipart upload. Returns (video_id, error)."""
     with open(file_path, "rb") as f:
         d = _post(
             f"act_{ad_account_id}/advideos",
             token,
             data={"name": name},
             files={"source": (os.path.basename(file_path), f, "video/mp4")},
-            timeout=T_UPLOAD,
         )
     if err := _err(d):
         return None, err
@@ -117,38 +119,44 @@ def upload_video(
 
 def check_video_status(token: str, video_id: str) -> tuple[str, str | None]:
     """
-    Single status check for one video.
-    Returns (status_string, error_message).
-    status_string: "ready" | "processing" | "error" | "rate_limited"
+    Single non-blocking status check.
+    Returns (status, error_or_None).
+    status: "ready" | "processing" | "rate_limited" | "error" | "network_error"
+    Callers should treat "network_error" the same as "processing" (try again).
     """
-    d = _get(video_id, token, timeout=T_POLL, fields="status,id")
+    d = _get_once(video_id, token, fields="status,id")
 
-    # Rate limit — caller should back off
+    # Network hiccup — just try again next interval
+    if "_network_error" in d:
+        return "network_error", d["_network_error"]
+
+    # Rate limit
     err_code = d.get("error", {}).get("code")
     if err_code == 4:
         return "rate_limited", None
 
+    # Other API error
     if api_err := _err(d):
         return "error", f"poll API error: {api_err}"
 
-    raw_status = d.get("status", "")
-    if isinstance(raw_status, dict):
-        vs = raw_status.get("video_status", "processing")
-    elif isinstance(raw_status, str):
-        vs = raw_status.lower()
+    raw = d.get("status", "")
+    if isinstance(raw, dict):
+        vs = raw.get("video_status", "processing").lower()
+    elif isinstance(raw, str):
+        vs = raw.strip().lower()
     else:
         vs = "processing"
 
     if vs in ("ready", "ready_to_publish"):
         return "ready", None
     if vs == "error":
-        return "error", f"processing error: {raw_status}"
+        return "error", f"Meta encoding error: {raw}"
     return vs or "processing", None
 
 
 def get_video_thumbnail(token: str, video_id: str) -> str | None:
-    """Fetch Meta's auto-generated thumbnail URI for the video."""
-    d = _get(video_id, token, timeout=T_POLL, fields="thumbnails")
+    """Fetch Meta's preferred thumbnail URI."""
+    d = _get(video_id, token, fields="thumbnails")
     thumbs = d.get("thumbnails", {}).get("data", [])
     if not thumbs:
         return None
@@ -182,10 +190,9 @@ def create_video_creative(
     if thumb_url:
         video_data["image_url"] = thumb_url
 
-    story_spec = {"page_id": page_id, "video_data": video_data}
-    data = {
+    data: dict = {
         "name":              name,
-        "object_story_spec": json.dumps(story_spec),
+        "object_story_spec": json.dumps({"page_id": page_id, "video_data": video_data}),
     }
     if product_set_id:
         data["degrees_of_freedom_spec"] = json.dumps({
