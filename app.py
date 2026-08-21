@@ -42,7 +42,7 @@ STATUS_EMOJI = {
     "failed":   "❌",
 }
 
-MAX_WORKERS = 5   # parallel threads per phase
+MAX_WORKERS = 5   # parallel threads per phase (creatives/ads)
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -63,6 +63,11 @@ with st.sidebar:
     cta_link   = st.text_input("CTA Link", value="http://fkrt.it/cPDqXgNN")
     ad_message = st.text_input("Ad Message", placeholder="Check out our latest!")
     ad_title   = st.text_input("Ad Title",   placeholder="Optional — falls back to filename")
+
+    st.divider()
+    st.subheader("Upload Settings")
+    upload_batch_size = st.slider("Upload batch size", min_value=1, max_value=5, value=3,
+                                   help="Videos uploaded simultaneously per batch")
 
     st.divider()
     st.subheader("Video Source")
@@ -195,26 +200,28 @@ def run_phase(fn_map: dict):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 1 — Upload all videos in parallel
+# PHASE 1 — Upload videos in batches
 # ═══════════════════════════════════════════════════════════════════════════════
-for r in live:
-    r["status"] = "uploading"
-render(tbl_ph, live, f"📤 Phase 1/4 — Uploading {total} videos in parallel…")
-
 def _upload(idx):
     r = live[idx]
     video_id, err = upload_video(meta_token, ad_account_id, r["file_path"], r["ad_name"])
     return video_id, err
 
-upload_results = run_phase({i: (lambda i=i: _upload(i)) for i in range(total)})
+all_indices = list(range(total))
+batches = [all_indices[s:s + upload_batch_size] for s in range(0, total, upload_batch_size)]
+n_batches = len(batches)
 
-for i, (video_id, err) in upload_results.items():
-    if video_id:
-        live[i]["video_id"] = video_id
-    else:
-        live[i].update({"status": "failed", "error": f"Upload: {err}"})
-
-render(tbl_ph, live)
+for b_num, batch in enumerate(batches, 1):
+    for i in batch:
+        live[i]["status"] = "uploading"
+    render(tbl_ph, live, f"📤 Phase 1/4 — Uploading batch {b_num}/{n_batches} ({len(batch)} video(s))…")
+    batch_results = run_phase({i: (lambda i=i: _upload(i)) for i in batch})
+    for i, (video_id, err) in batch_results.items():
+        if video_id:
+            live[i]["video_id"] = video_id
+        else:
+            live[i].update({"status": "failed", "error": f"Upload: {err}"})
+    render(tbl_ph, live)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PHASE 2 — Poll all videos via round-robin (avoids rate limit)
