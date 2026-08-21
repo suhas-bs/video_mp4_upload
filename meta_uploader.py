@@ -116,22 +116,45 @@ def upload_video(
 
 
 def poll_video_ready(
-    token: str, video_id: str, max_retries: int = 36, interval: int = 5
+    token: str, video_id: str, max_retries: int = 60, interval: int = 5
 ) -> tuple[bool, str]:
     """
-    Poll until status = ready. ~3 min max.
+    Poll until status = ready. ~5 min max.
     Returns (is_ready, message).
+
+    Meta returns status in two possible shapes:
+      {"status": {"video_status": "ready"}}   ← advideos node
+      {"status": "READY"}                      ← some API versions return a plain string
+    Also surfaces API errors so empty-status doesn't silently loop.
     """
     vs = ""
-    for _ in range(max_retries):
-        d = _get(video_id, token, timeout=T_POLL, fields="status")
-        vs = d.get("status", {}).get("video_status", "")
-        if vs == "ready":
+    last_raw = ""
+    for attempt in range(max_retries):
+        d = _get(video_id, token, timeout=T_POLL, fields="status,id")
+
+        # Surface any API error immediately — no point retrying a permission error
+        if api_err := _err(d):
+            return False, f"poll API error: {api_err}"
+
+        raw_status = d.get("status", "")
+
+        # Shape 1: {"status": {"video_status": "ready"}}
+        if isinstance(raw_status, dict):
+            vs = raw_status.get("video_status", "")
+        # Shape 2: {"status": "READY"} or {"status": "processing"}
+        elif isinstance(raw_status, str):
+            vs = raw_status.lower()
+
+        last_raw = repr(raw_status)
+
+        if vs in ("ready", "ready_to_publish"):
             return True, "ready"
         if vs == "error":
-            return False, f"processing error: {d.get('status')}"
+            return False, f"processing error: {raw_status}"
+
         time.sleep(interval)
-    return False, f"timed out after {max_retries * interval}s (last: {vs!r})"
+
+    return False, f"timed out after {max_retries * interval}s — last response status={last_raw}. Check that your token has ads_management permission and the video_id {video_id!r} is in your ad account."
 
 
 def get_video_thumbnail(token: str, video_id: str) -> str | None:
