@@ -115,46 +115,35 @@ def upload_video(
     return video_id, None
 
 
-def poll_video_ready(
-    token: str, video_id: str, max_retries: int = 60, interval: int = 5
-) -> tuple[bool, str]:
+def check_video_status(token: str, video_id: str) -> tuple[str, str | None]:
     """
-    Poll until status = ready. ~5 min max.
-    Returns (is_ready, message).
-
-    Meta returns status in two possible shapes:
-      {"status": {"video_status": "ready"}}   ← advideos node
-      {"status": "READY"}                      ← some API versions return a plain string
-    Also surfaces API errors so empty-status doesn't silently loop.
+    Single status check for one video.
+    Returns (status_string, error_message).
+    status_string: "ready" | "processing" | "error" | "rate_limited"
     """
-    vs = ""
-    last_raw = ""
-    for attempt in range(max_retries):
-        d = _get(video_id, token, timeout=T_POLL, fields="status,id")
+    d = _get(video_id, token, timeout=T_POLL, fields="status,id")
 
-        # Surface any API error immediately — no point retrying a permission error
-        if api_err := _err(d):
-            return False, f"poll API error: {api_err}"
+    # Rate limit — caller should back off
+    err_code = d.get("error", {}).get("code")
+    if err_code == 4:
+        return "rate_limited", None
 
-        raw_status = d.get("status", "")
+    if api_err := _err(d):
+        return "error", f"poll API error: {api_err}"
 
-        # Shape 1: {"status": {"video_status": "ready"}}
-        if isinstance(raw_status, dict):
-            vs = raw_status.get("video_status", "")
-        # Shape 2: {"status": "READY"} or {"status": "processing"}
-        elif isinstance(raw_status, str):
-            vs = raw_status.lower()
+    raw_status = d.get("status", "")
+    if isinstance(raw_status, dict):
+        vs = raw_status.get("video_status", "processing")
+    elif isinstance(raw_status, str):
+        vs = raw_status.lower()
+    else:
+        vs = "processing"
 
-        last_raw = repr(raw_status)
-
-        if vs in ("ready", "ready_to_publish"):
-            return True, "ready"
-        if vs == "error":
-            return False, f"processing error: {raw_status}"
-
-        time.sleep(interval)
-
-    return False, f"timed out after {max_retries * interval}s — last response status={last_raw}. Check that your token has ads_management permission and the video_id {video_id!r} is in your ad account."
+    if vs in ("ready", "ready_to_publish"):
+        return "ready", None
+    if vs == "error":
+        return "error", f"processing error: {raw_status}"
+    return vs or "processing", None
 
 
 def get_video_thumbnail(token: str, video_id: str) -> str | None:

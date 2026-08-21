@@ -12,6 +12,7 @@ so the live status table stays accurate and readable.
 """
 
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -24,9 +25,9 @@ from drive_helper import (
     list_mp4_files,
 )
 from meta_uploader import (
+    check_video_status,
     create_ad,
     create_video_creative,
-    poll_video_ready,
     upload_video,
 )
 
@@ -189,7 +190,7 @@ def run_phase(fn_map: dict):
             try:
                 results[idx] = future.result()
             except Exception as e:
-                results[idx] = ("error", str(e))
+                results[idx] = (None, str(e))
     return results
 
 
@@ -216,21 +217,44 @@ for i, (video_id, err) in upload_results.items():
 render(tbl_ph, live)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — Poll all uploaded videos for ready status in parallel
+# PHASE 2 — Poll all videos via round-robin (avoids rate limit)
+# Check each video once per round, wait 15s, repeat until all are done.
 # ═══════════════════════════════════════════════════════════════════════════════
 to_poll = [i for i in range(total) if live[i].get("video_id") and live[i]["status"] != "failed"]
 for i in to_poll:
     live[i]["status"] = "encoding"
 render(tbl_ph, live, f"⏳ Phase 2/4 — Waiting for {len(to_poll)} videos to finish encoding…")
 
-def _poll(idx):
-    return poll_video_ready(meta_token, live[idx]["video_id"])
+POLL_INTERVAL   = 15   # seconds between full rounds
+POLL_MAX_ROUNDS = 24   # 24 × 15s = 6 min max
+RATE_LIMIT_WAIT = 60   # back off 60s on rate limit
 
-poll_results = run_phase({i: (lambda i=i: _poll(i)) for i in to_poll})
+pending_poll = set(to_poll)
+for round_num in range(POLL_MAX_ROUNDS):
+    if not pending_poll:
+        break
+    done_this_round = set()
+    for i in list(pending_poll):
+        vs, err = check_video_status(meta_token, live[i]["video_id"])
+        if vs == "rate_limited":
+            phase_ph.warning(f"⚠️ Rate limit hit — waiting {RATE_LIMIT_WAIT}s…")
+            time.sleep(RATE_LIMIT_WAIT)
+            break   # restart this round after backoff
+        elif vs == "ready":
+            done_this_round.add(i)
+        elif vs == "error":
+            live[i].update({"status": "failed", "error": f"Encoding: {err}"})
+            done_this_round.add(i)
+        time.sleep(1)  # 1s between each individual check within a round
 
-for i, (ready, msg) in poll_results.items():
-    if not ready:
-        live[i].update({"status": "failed", "error": f"Encoding: {msg}"})
+    pending_poll -= done_this_round
+    render(tbl_ph, live, f"⏳ Phase 2/4 — {len(pending_poll)} video(s) still encoding… (round {round_num+1}/{POLL_MAX_ROUNDS})")
+    if pending_poll:
+        time.sleep(POLL_INTERVAL)
+
+# Mark anything still pending as timed out
+for i in pending_poll:
+    live[i].update({"status": "failed", "error": "Encoding timed out after 6 min"})
 
 render(tbl_ph, live)
 
